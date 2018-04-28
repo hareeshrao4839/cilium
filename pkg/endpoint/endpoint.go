@@ -1694,6 +1694,7 @@ func (e *Endpoint) replaceIdentityLabels(l pkgLabels.Labels) int {
 	e.Mutex.Lock()
 	changed := false
 
+	e.OpLabels.Custom.MarkAllForDeletion()
 	e.OpLabels.OrchestrationIdentity.MarkAllForDeletion()
 	e.OpLabels.Disabled.MarkAllForDeletion()
 
@@ -1707,7 +1708,7 @@ func (e *Endpoint) replaceIdentityLabels(l pkgLabels.Labels) int {
 		}
 	}
 
-	if e.OpLabels.OrchestrationIdentity.DeleteMarked() || e.OpLabels.Disabled.DeleteMarked() {
+	if e.OpLabels.Custom.DeleteMarked() || e.OpLabels.OrchestrationIdentity.DeleteMarked() || e.OpLabels.Disabled.DeleteMarked() {
 		changed = true
 	}
 
