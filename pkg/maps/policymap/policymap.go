@@ -100,10 +100,23 @@ func (key *policyKey) GetIdentity() uint32 {
 	return key.Identity
 }
 
+func (key *policyKey) GetPort() uint16 {
+	return key.DestPort
+}
+
+func (key *policyKey) GetProto() uint8 {
+	return key.Nexthdr
+}
+
+func (key *policyKey) GetDirection() uint8 {
+	return key.TrafficDirection
+}
+
 // Allow pushes an entry into the PolicyMap to allow traffic in the given
 // `trafficDirection` for identity `id` with destination port `dport` over
 // protocol `proto`.
 func (pm *PolicyMap) Allow(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection TrafficDirection) error {
+	log.Debugf("PolicyMap.Allow: id: %d, dport: %d, proto: %d, trafficDirection: %s", id, dport, proto, trafficDirection)
 	key := policyKey{Identity: id, DestPort: byteorder.HostToNetwork(dport).(uint16), Nexthdr: uint8(proto), TrafficDirection: trafficDirection.Uint8()}
 	entry := PolicyEntry{}
 	return bpf.UpdateElement(pm.Fd, unsafe.Pointer(&key), unsafe.Pointer(&entry), 0)
@@ -122,6 +135,7 @@ func (pm *PolicyMap) Exists(id uint32, dport uint16, proto u8proto.U8proto, traf
 // sending traffic in direction `trafficDirection` with destination port `dport`
 // over protocol `proto`. Returns an error if the deletion did not succeed.
 func (pm *PolicyMap) Delete(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection TrafficDirection) error {
+	log.Debugf("PolicyMap.Delete: id: %d, dport: %d, proto: %d, trafficDirection: %s", id, byteorder.HostToNetwork(dport).(uint16), proto, trafficDirection)
 	key := policyKey{Identity: id, DestPort: byteorder.HostToNetwork(dport).(uint16), Nexthdr: uint8(proto), TrafficDirection: trafficDirection.Uint8()}
 	return bpf.DeleteElement(pm.Fd, unsafe.Pointer(&key))
 }
@@ -129,6 +143,7 @@ func (pm *PolicyMap) Delete(id uint32, dport uint16, proto u8proto.U8proto, traf
 // DeleteEntry removes an entry from the PolicyMap. It can be used in
 // conjunction with DumpToSlice() to inspect and delete map entries.
 func (pm *PolicyMap) DeleteEntry(entry *PolicyEntryDump) error {
+	log.Debugf("PolicyMap.DeleteEntry: id: %d, dport: %d, proto: %d, trafficDirection: %s", entry.Key.Identity, entry.Key.DestPort, entry.Key.Nexthdr, entry.Key.TrafficDirection)
 	return bpf.DeleteElement(pm.Fd, unsafe.Pointer(&entry.Key))
 }
 

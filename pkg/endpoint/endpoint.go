@@ -536,6 +536,21 @@ type Endpoint struct {
 	// ProxyWaitGroup waits for pending proxy changes to complete.
 	// You must hold Endpoint.BuildMutex to read or write it.
 	ProxyWaitGroup *completion.WaitGroup `json:"-"`
+
+	realizedMapState map[PolicyKeyMeta]struct{}
+
+	desiredMapState map[PolicyKeyMeta]struct{}
+}
+
+type PolicyKeyMeta struct {
+	ID               uint32
+	DPort            uint16
+	Proto            uint8
+	TrafficDirection policymap.TrafficDirection
+}
+
+func (k PolicyKeyMeta) String() string {
+	return fmt.Sprintf("id=%d, dport=%d, proto=%d, td=%s", k.ID, k.DPort, k.Proto, k.TrafficDirection)
 }
 
 // WaitForProxyCompletions blocks until all proxy changes have been completed.
@@ -950,14 +965,32 @@ func (e *Endpoint) GetPolicyModel() *models.EndpointPolicyStatus {
 	e.Consumable.Mutex.RLock()
 	defer e.Consumable.Mutex.RUnlock()
 
-	ingressIdentities := make([]int64, 0, len(e.Consumable.IngressIdentities))
-	for ingressIdentity := range e.Consumable.IngressIdentities {
-		ingressIdentities = append(ingressIdentities, int64(ingressIdentity))
+	realizedIngressIdentities := make([]int64, 0)
+	realizedEgressIdentities := make([]int64, 0)
+
+	for policyKeyMeta := range e.realizedMapState {
+		if policyKeyMeta.DPort == 0 {
+			if policyKeyMeta.TrafficDirection == policymap.Ingress {
+				realizedIngressIdentities = append(realizedIngressIdentities, int64(policyKeyMeta.ID))
+
+			} else {
+				realizedEgressIdentities = append(realizedEgressIdentities, int64(policyKeyMeta.ID))
+			}
+
+		}
 	}
 
-	egressIdentities := make([]int64, 0, len(e.Consumable.EgressIdentities))
-	for egressIdentity := range e.Consumable.EgressIdentities {
-		egressIdentities = append(egressIdentities, int64(egressIdentity))
+	desiredIngressIdentities := make([]int64, 0)
+	desiredEgressIdentities := make([]int64, 0)
+
+	for policyKeyMeta := range e.desiredMapState {
+		if policyKeyMeta.DPort == 0 {
+			if policyKeyMeta.TrafficDirection == policymap.Ingress {
+				desiredIngressIdentities = append(desiredIngressIdentities, int64(policyKeyMeta.ID))
+			} else {
+				desiredEgressIdentities = append(desiredEgressIdentities, int64(policyKeyMeta.ID))
+			}
+		}
 	}
 
 	policyIngressEnabled := e.Opts.IsEnabled(OptionIngressPolicy)
@@ -987,8 +1020,19 @@ func (e *Endpoint) GetPolicyModel() *models.EndpointPolicyStatus {
 		ID:                       int64(e.Consumable.ID),
 		Build:                    int64(e.Consumable.Iteration),
 		PolicyRevision:           int64(e.policyRevision),
-		AllowedIngressIdentities: ingressIdentities,
-		AllowedEgressIdentities:  egressIdentities,
+		AllowedIngressIdentities: realizedIngressIdentities,
+		AllowedEgressIdentities:  realizedEgressIdentities,
+		CidrPolicy:               e.L3Policy.GetModel(),
+		L4:                       e.Consumable.L4Policy.GetModel(),
+		PolicyEnabled:            policyEnabled,
+	}
+
+	desiredMdl := &models.EndpointPolicy{
+		ID:                       int64(e.Consumable.ID),
+		Build:                    int64(e.Consumable.Iteration),
+		PolicyRevision:           int64(e.policyRevision),
+		AllowedIngressIdentities: desiredIngressIdentities,
+		AllowedEgressIdentities:  desiredEgressIdentities,
 		CidrPolicy:               e.L3Policy.GetModel(),
 		L4:                       e.Consumable.L4Policy.GetModel(),
 		PolicyEnabled:            policyEnabled,
@@ -996,7 +1040,7 @@ func (e *Endpoint) GetPolicyModel() *models.EndpointPolicyStatus {
 	// FIXME GH-3280 Once we start returning revisions Realized should be the
 	// policy implemented in the data path
 	return &models.EndpointPolicyStatus{
-		Spec:                mdl,
+		Spec:                desiredMdl,
 		Realized:            mdl,
 		ProxyPolicyRevision: int64(e.proxyPolicyRevision),
 		ProxyStatistics:     proxyStats,
@@ -1238,10 +1282,14 @@ func (e *Endpoint) failedDirectoryPath() string {
 func (e *Endpoint) Allows(id identityPkg.NumericIdentity) bool {
 	e.Mutex.RLock()
 	defer e.Mutex.RUnlock()
-	if e.Consumable != nil {
-		return e.Consumable.AllowsIngress(id)
+
+	keyToLookup := PolicyKeyMeta{
+		ID:               uint32(id),
+		TrafficDirection: policymap.Ingress,
 	}
-	return false
+
+	_, ok := e.desiredMapState[keyToLookup]
+	return ok
 }
 
 // String returns endpoint on a JSON format.
@@ -2414,4 +2462,94 @@ func (e *Endpoint) IPs() []net.IP {
 // manager. The endpoint must be read locked.
 func (e *Endpoint) InsertEvent() {
 	e.getLogger().Info("New endpoint")
+}
+
+func (e *Endpoint) syncPolicyWithDatapath() {
+	ctrlName := fmt.Sprintf("sync-policymap-%d", e.ID)
+	e.controllers.UpdateController(ctrlName,
+		controller.ControllerParams{
+			DoFunc: func() error {
+				e.Mutex.Lock()
+				defer e.Mutex.Unlock()
+
+				if e.realizedMapState == nil {
+					e.realizedMapState = make(map[PolicyKeyMeta]struct{})
+				}
+
+				currentMapContents, err := e.PolicyMap.DumpToSlice()
+
+				for k := range e.desiredMapState {
+					log.Debugf("sync-policymap-%d controller: desiredMapState: %s", e.ID, k)
+				}
+
+				for k := range e.desiredMapState {
+					log.Debugf("sync-policymap-%d controller: realizedMapState: %s", e.ID, k)
+				}
+
+				if err != nil {
+					log.Errorf("sync-policymap-%d controller: ERROR DUMPING POLICYMAP", e.ID)
+					return fmt.Errorf("unable to dump PolicyMap for endpoint: %s", err)
+				}
+
+				for _, entry := range currentMapContents {
+					keyToAnalyze := PolicyKeyMeta{
+						ID:               entry.Key.GetIdentity(),
+						DPort:            byteorder.NetworkToHost(entry.Key.GetPort()).(uint16),
+						Proto:            entry.Key.GetProto(),
+						TrafficDirection: policymap.TrafficDirection(entry.Key.GetDirection()),
+					}
+
+					log.WithFields(logrus.Fields{
+						logfields.Identity:         keyToAnalyze.ID,
+						logfields.Port:             keyToAnalyze.DPort,
+						logfields.Protocol:         keyToAnalyze.Proto,
+						logfields.TrafficDirection: keyToAnalyze.TrafficDirection,
+					}).Debugf("sync-policymap-%d controller: current map contents", e.ID)
+
+					// If key that is in policy map is not in desired state, just remove it.
+					if _, ok := e.desiredMapState[keyToAnalyze]; !ok {
+						log.WithFields(logrus.Fields{
+							logfields.Identity:         keyToAnalyze.ID,
+							logfields.Port:             keyToAnalyze.DPort,
+							logfields.Protocol:         keyToAnalyze.Proto,
+							logfields.TrafficDirection: keyToAnalyze.TrafficDirection,
+						}).Debugf("sync-policymap-%d controller: calling delete on endpoint policymap for endpoint desired map state entry because it is not in endpoint desired map state", e.ID)
+						err := e.PolicyMap.Delete(keyToAnalyze.ID, byteorder.HostToNetwork(keyToAnalyze.DPort).(uint16), u8proto.U8proto(keyToAnalyze.Proto), keyToAnalyze.TrafficDirection)
+						if err != nil {
+							log.Errorf("sync-policymap-%d controller: ERROR DELETING FROM  POLICYMAP", e.ID)
+							return err
+						}
+						// Remove from realized state
+						delete(e.realizedMapState, keyToAnalyze)
+					}
+				}
+
+				for keyToAdd := range e.desiredMapState {
+					if _, ok := e.realizedMapState[keyToAdd]; !ok {
+						log.WithFields(logrus.Fields{
+							logfields.Identity:         keyToAdd.ID,
+							logfields.Port:             keyToAdd.DPort,
+							logfields.Protocol:         keyToAdd.Proto,
+							logfields.TrafficDirection: keyToAdd.TrafficDirection,
+						}).Debugf("sync-policymap-%d controller: calling allow on endpoint policymap for endpoint desired map state entry because it is not in realized state", e.ID)
+						err := e.PolicyMap.Allow(keyToAdd.ID, keyToAdd.DPort, u8proto.U8proto(keyToAdd.Proto), keyToAdd.TrafficDirection)
+						if err != nil {
+							log.Errorf("sync-policymap-%d controller: ERROR ADDING TO POLICYMAP", e.ID)
+							return err
+						}
+						e.realizedMapState[keyToAdd] = struct{}{}
+					}
+				}
+
+				// TODO: this is only done once unfortunately because the way
+				// L4Policy is calculated makes it hard to map it directly to
+				// policy map updates.
+				//e.RealizedL4Policy = e.DesiredL4Policy
+				//e.setPolicyRevision(e.nextPolicyRevision)
+
+				return nil
+			},
+			RunInterval: time.Duration(1) * time.Minute,
+		},
+	)
 }

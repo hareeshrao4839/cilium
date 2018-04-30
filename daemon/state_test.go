@@ -28,7 +28,6 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/mac"
-	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/monitor"
 	"github.com/cilium/cilium/pkg/policy"
 
@@ -85,8 +84,6 @@ func endpointCreator(id uint16, secID identity.NumericIdentity) *e.Endpoint {
 				"foo" + strID: labels.NewLabel("foo"+strID, "", ""),
 			},
 		},
-		PolicyMaps:        map[int]*policymap.PolicyMap{},
-		IngressIdentities: map[identity.NumericIdentity]bool{},
 	}
 	return ep
 }
