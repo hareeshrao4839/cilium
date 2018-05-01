@@ -16,7 +16,6 @@ package policy
 
 import (
 	"bytes"
-	"fmt"
 
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/op/go-logging"
